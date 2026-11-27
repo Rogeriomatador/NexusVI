@@ -158,6 +158,8 @@ impl Cfg {
     /// ends the program counts as dependent on every branch that leads to it.
     pub fn control_dependence(&self, ipdom: &[PostDom]) -> Vec<Vec<usize>> {
         let mut cd: Vec<Vec<usize>> = vec![Vec::new(); self.start.len()];
+        // Branch IDs are visited in ascending order, and only the current ID is
+        // appended. If it is already present in a block's list, it must be last.
         for (a, s) in self.succ.iter().enumerate() {
             if s.len() < 2 {
                 continue;
@@ -169,7 +171,7 @@ impl Cfg {
                     if PostDom::Block(run) == stop {
                         break;
                     }
-                    if !cd[run].contains(&a) {
+                    if cd[run].last() != Some(&a) {
                         cd[run].push(a);
                     } else {
                         break;
@@ -182,7 +184,7 @@ impl Cfg {
                             // runs only on this side
                             let mut todo = self.succ[run].clone();
                             while let Some(b) = todo.pop() {
-                                if !cd[b].contains(&a) {
+                                if cd[b].last() != Some(&a) {
                                     cd[b].push(a);
                                     todo.extend(self.succ[b].iter().copied());
                                 }
@@ -327,6 +329,29 @@ mod tests {
         assert_eq!(g.post_dominators(), vec![PostDom::Exit, PostDom::Block(3), PostDom::Block(4), PostDom::Exit, PostDom::Exit]);
         let empty = Cfg { start: vec![], block_of: vec![], succ: vec![], pred: vec![], len: 0 };
         assert!(empty.post_dominators().is_empty());
+    }
+
+    #[test]
+    fn shared_successors_keep_all_branch_ids_in_order() {
+        let n = 128;
+        let mut succ = vec![vec![n, n + 1]; n];
+        succ.extend([vec![], vec![]]);
+        let mut pred = vec![vec![]; n + 2];
+        pred[n] = (0..n).collect();
+        pred[n + 1] = (0..n).collect();
+        let g = Cfg {
+            start: (0..n + 2).collect(),
+            block_of: (0..n + 2).collect(),
+            succ,
+            pred,
+            len: n + 2,
+        };
+        let pd = g.post_dominators();
+        let cd = g.control_dependence(&pd);
+        let expected: Vec<usize> = (0..n).collect();
+        assert_eq!(cd[n], expected);
+        assert_eq!(cd[n + 1], expected);
+        assert!(cd[..n].iter().all(Vec::is_empty));
     }
 
     #[test]
