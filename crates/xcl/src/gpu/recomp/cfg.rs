@@ -38,7 +38,7 @@ impl Cfg {
     pub fn new(insts: &[Decoded]) -> Option<Cfg> {
         let n = insts.len();
         let pcs: BTreeMap<u64, usize> = insts.iter().enumerate().map(|(i, d)| (d.pc, i)).collect();
-        let succ_i: Vec<Vec<usize>> = super::upper_lanes::successors(insts, &pcs).into_iter().collect::<Option<_>>()?;
+        let succ_i: Vec<_> = super::upper_lanes::successors(insts, &pcs).collect::<Option<_>>()?;
         let mut leader = vec![false; n];
         if n > 0 {
             leader[0] = true;
@@ -49,7 +49,7 @@ impl Cfg {
                 if i + 1 < n {
                     leader[i + 1] = true;
                 }
-                for &t in s {
+                for &t in s.as_slice() {
                     leader[t] = true;
                 }
             }
@@ -64,7 +64,7 @@ impl Cfg {
         let mut pred: Vec<Vec<usize>> = vec![Vec::new(); start.len()];
         for b in 0..start.len() {
             let last = start.get(b + 1).copied().unwrap_or(n) - 1;
-            for &t in &succ_i[last] {
+            for &t in succ_i[last].as_slice() {
                 let tb = block_of[t];
                 if !succ[b].contains(&tb) {
                     succ[b].push(tb);
@@ -223,6 +223,15 @@ mod tests {
     const CMP: I = ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 1)], None);
     const MOV2: I = ("S_MOV_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 129)], None);
     const MOV3: I = ("S_MOV_B32", "ENC_SOP1", &[("SDST", 3), ("SSRC0", 130)], None);
+
+    #[test]
+    fn coincident_branch_edges_end_the_block_but_have_one_predecessor() {
+        let p = program(&[MOV2, ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 0)], None), MOV3]);
+        let g = Cfg::new(&p).unwrap();
+        assert_eq!(g.start, vec![0, 2]);
+        assert_eq!(g.succ, vec![vec![1], vec![]]);
+        assert_eq!(g.pred, vec![vec![], vec![0]]);
+    }
 
     #[test]
     fn an_if_without_else() {

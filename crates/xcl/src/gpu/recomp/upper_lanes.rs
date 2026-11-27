@@ -712,34 +712,50 @@ fn classify(d: &Decoded, st: &State) -> Option<(Read, Option<(u64, u32)>)> {
     }
 }
 
-/// Successors of each instruction (index); None: unknown (an indirect jump).
-pub(super) fn successors(insts: &[Decoded], pcs: &BTreeMap<u64, usize>) -> Vec<Option<Vec<usize>>> {
-    insts
-        .iter()
-        .enumerate()
-        .map(|(i, d)| {
-            let next = insts.get(i + 1).map(|n| n.pc).and_then(|pc| pcs.get(&pc).copied());
-            if let Some(t) = d.far_target {
-                return Some(vec![*pcs.get(&t)?]);
-            }
-            if fetch_call(d) {
-                return Some(next.into_iter().collect());
-            }
-            if d.inst.flags & F_INDIRECT != 0 || d.inst.name == "S_SETPC_B64" || d.inst.name == "S_SWAPPC_B64" {
-                return None;
-            }
-            let mut out = Vec::new();
-            if let Some(t) = rdna2::branch_target(d) {
-                out.push(*pcs.get(&t)?);
-                if d.inst.flags & F_CONDITIONAL != 0 {
-                    out.extend(next);
+/// Known instruction edges fit inline: a branch target and an optional fall-through.
+pub(super) enum Edges {
+    End,
+    One(usize),
+    Two([usize; 2]),
+}
+
+impl Edges {
+    pub(super) fn as_slice(&self) -> &[usize] {
+        match self {
+            Self::End => &[],
+            Self::One(i) => std::slice::from_ref(i),
+            Self::Two(pair) => pair,
+        }
+    }
+}
+
+/// None means an unknown edge, distinct from a known program end.
+pub(super) fn successors<'a>(insts: &'a [Decoded], pcs: &'a BTreeMap<u64, usize>) -> impl Iterator<Item = Option<Edges>> + 'a {
+    insts.iter().enumerate().map(move |(i, d)| {
+        let next = || insts.get(i + 1).and_then(|n| pcs.get(&n.pc).copied());
+        if let Some(t) = d.far_target {
+            return Some(Edges::One(*pcs.get(&t)?));
+        }
+        if fetch_call(d) {
+            return Some(next().map_or(Edges::End, Edges::One));
+        }
+        if d.inst.flags & F_INDIRECT != 0 || d.inst.name == "S_SETPC_B64" || d.inst.name == "S_SWAPPC_B64" {
+            return None;
+        }
+        if let Some(t) = rdna2::branch_target(d) {
+            let target = *pcs.get(&t)?;
+            if d.inst.flags & F_CONDITIONAL != 0 {
+                if let Some(fallthrough) = next() {
+                    return Some(Edges::Two([target, fallthrough]));
                 }
-            } else if d.inst.flags & F_TERMINATOR == 0 {
-                out.extend(next);
             }
-            Some(out)
-        })
-        .collect()
+            Some(Edges::One(target))
+        } else if d.inst.flags & F_TERMINATOR == 0 {
+            Some(next().map_or(Edges::End, Edges::One))
+        } else {
+            Some(Edges::End)
+        }
+    })
 }
 
 #[cfg(test)]
@@ -758,7 +774,7 @@ pub fn analyze(insts: &[Decoded]) -> UpperLanes {
     let pcs: BTreeMap<u64, usize> = insts.iter().enumerate().map(|(i, d)| (d.pc, i)).collect();
     // (a loop that runs out of its iteration budget, `LOOP_GUARD`, leaves from wherever it is:
     // not followed – the program's results are wrong by then anyway)
-    let succ = successors(insts, &pcs);
+    let succ: Vec<_> = successors(insts, &pcs).collect();
     let mut at: Vec<Option<State>> = vec![None; insts.len()];
     at[0] = Some(State::entry());
     let mut work = BTreeSet::from([0usize]);
@@ -789,7 +805,7 @@ pub fn analyze(insts: &[Decoded]) -> UpperLanes {
             }
             return out;
         };
-        for &j in s {
+        for &j in s.as_slice() {
             let new = match &at[j] {
                 None => st.clone(),
                 Some(old) => old.join(&st),
