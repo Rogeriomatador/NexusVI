@@ -485,7 +485,23 @@ unsafe extern "system" fn cl_set_descriptor_heaps(this: *mut c_void, n: u32, hea
 }
 /// #26 ResourceBarrier(n, barriers): D3D12_RESOURCE_BARRIER, 32 bytes each
 unsafe extern "system" fn cl_resource_barrier(this: *mut c_void, n: u32, barriers: *const [u32; 8]) {
-    let mut w = vec![TRANSITIONS_MARKER, n];
+    if n == 0 || barriers.is_null() {
+        return;
+    }
+    const INLINE_BARRIERS: usize = 8;
+    if n as usize <= INLINE_BARRIERS {
+        let mut buf = [0u32; 2 + 8 * INLINE_BARRIERS];
+        buf[0] = TRANSITIONS_MARKER;
+        buf[1] = n;
+        for k in 0..n as usize {
+            buf[2 + 8 * k..2 + 8 * (k + 1)].copy_from_slice(&*barriers.add(k));
+        }
+        push(this as usize, &buf[..2 + 8 * n as usize]);
+        return;
+    }
+    let mut w = Vec::with_capacity(2 + 8 * n as usize);
+    w.push(TRANSITIONS_MARKER);
+    w.push(n);
     for k in 0..n as usize {
         w.extend_from_slice(&*barriers.add(k));
     }
@@ -797,9 +813,17 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 let n = get(1) as usize;
                 let words = &words[(at + 2).min(words.len())..(at + 2 + 8 * n).min(words.len())];
                 if words.len() == 8 * n && n > 0 {
-                    // 4-byte aligned in the stream: copy out; the resource pointers are
-                    // borrowed (ManuallyDrop fields, nothing released)
-                    let mut b: Vec<u64> = vec![0; 4 * n];
+                    // 4-byte aligned in the stream: copy out into an 8-byte aligned buffer;
+                    // the resource pointers are borrowed (ManuallyDrop fields, nothing released).
+                    const INLINE_BARRIERS: usize = 8;
+                    let mut stack_buf = [0u64; 4 * INLINE_BARRIERS];
+                    let mut heap_buf = Vec::new();
+                    let b: &mut [u64] = if n <= INLINE_BARRIERS {
+                        &mut stack_buf[..4 * n]
+                    } else {
+                        heap_buf.resize(4 * n, 0);
+                        &mut heap_buf
+                    };
                     std::ptr::copy_nonoverlapping(words.as_ptr() as *const u8, b.as_mut_ptr() as *mut u8, 32 * n);
                     if super::title_textures::any() {
                         // each barrier: type | flags, resource, subresource | before, after
@@ -1138,6 +1162,14 @@ mod tests {
             assert_eq!((bound.len(), has_sampler), (2, true));
 
             list.Close().unwrap();
+        }
+    }
+
+    #[test]
+    fn empty_or_null_resource_barrier_is_ignored() {
+        unsafe {
+            cl_resource_barrier(std::ptr::null_mut(), 0, std::ptr::null());
+            cl_resource_barrier(std::ptr::null_mut(), 4, std::ptr::null());
         }
     }
 }
