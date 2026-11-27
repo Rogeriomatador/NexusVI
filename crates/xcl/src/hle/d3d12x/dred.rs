@@ -50,6 +50,12 @@ fn label_of(pso: usize) -> Option<String> {
     LABELS.lock().unwrap().as_ref()?.get(&pso).cloned()
 }
 
+/// Static UTF-16 marker payload `"xcl pipeline\0"` to avoid per-draw heap allocations.
+const PIPELINE_MARKER_UTF16: [u16; 13] = [
+    b'x' as u16, b'c' as u16, b'l' as u16, b' ' as u16, b'p' as u16, b'i' as u16, b'p' as u16,
+    b'e' as u16, b'l' as u16, b'i' as u16, b'n' as u16, b'e' as u16, 0,
+];
+
 /// After `SetPipelineState(pso)` on `list`: a marker, and the label of what is bound now.
 /// `pso` is the title's object, `bound` what reached the PC list (a stand-in while it builds).
 pub unsafe fn mark_pipeline(list: *mut c_void, pso: usize, bound: usize) {
@@ -58,16 +64,24 @@ pub unsafe fn mark_pipeline(list: *mut c_void, pso: usize, bound: usize) {
     }
     // nothing labelled: a stand-in still building, or a pipeline of PC shaders
     let text = label_of(bound).unwrap_or_else(|| format!("pipeline {pso:#x} (a stand-in, or not translated)"));
-    let first = !MARKS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).and_then(|r| r.last()).is_some_and(|v| v.iter().any(Option::is_some));
-    push(list as usize, Some(text));
+    let first = {
+        let mut g = MARKS.lock().unwrap();
+        let recordings = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();
+        if recordings.is_empty() {
+            recordings.push(Vec::new());
+        }
+        let cur = recordings.last_mut().unwrap();
+        let first = !cur.iter().any(Option::is_some);
+        cur.push(Some(text));
+        first
+    };
     if let Some(l) = ID3D12GraphicsCommandList::from_raw_borrowed(&list) {
         // DRED's node may give the list's name and not its pointer (NVIDIA, Windows 26300)
         if first {
             let _ = l.SetName(&windows::core::HSTRING::from(format!("xcl list {:#x}", list as usize)));
         }
-        let w: Vec<u16> = "xcl pipeline".encode_utf16().chain([0]).collect();
         OWN_MARKER.with(|f| f.set(true));
-        l.SetMarker(0, Some(w.as_ptr() as *const c_void), (w.len() * 2) as u32);
+        l.SetMarker(0, Some(PIPELINE_MARKER_UTF16.as_ptr() as *const c_void), std::mem::size_of_val(&PIPELINE_MARKER_UTF16) as u32);
         OWN_MARKER.with(|f| f.set(false));
     }
 }
@@ -209,5 +223,11 @@ mod tests {
         assert_eq!(bound_after(list, &h, 2), vec!["ms b ps c".to_string()]);
         assert_eq!(bound_after(list, &h, 6), Vec::<String>::new());
         MARKS.lock().unwrap().as_mut().unwrap().remove(&list);
+    }
+
+    #[test]
+    fn pipeline_marker_utf16_matches_expected_string() {
+        let expected: Vec<u16> = "xcl pipeline".encode_utf16().chain([0]).collect();
+        assert_eq!(PIPELINE_MARKER_UTF16.as_slice(), expected.as_slice());
     }
 }

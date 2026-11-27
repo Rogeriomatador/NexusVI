@@ -1176,4 +1176,29 @@ mod tests {
         assert_eq!(sampler_own_index(&[], 0), 0);
         assert_eq!(sampler_own_index(&[], 42), 42);
     }
+
+    #[test]
+    fn bench_shared_heap_range_churn_coalesces_without_leak() {
+        const CAP: u32 = 1_000_000;
+        const CYCLES: usize = 5_000;
+        let mut free: Vec<(u32, u32)> = Vec::new();
+        let mut next = 64u32;
+        let mut live: Vec<(u32, u32)> = Vec::with_capacity(64);
+        let t0 = std::time::Instant::now();
+        for i in 0..CYCLES {
+            let count = if i % 4 == 0 { 512 } else { 256 };
+            let start = take_range(&mut free, &mut next, CAP, count).expect("shared heap range");
+            live.push((start, count));
+            if live.len() >= 32 {
+                let (f, n) = live.remove(i % live.len());
+                merge_release(&mut free, f, n);
+            }
+        }
+        for (f, n) in live {
+            merge_release(&mut free, f, n);
+        }
+        let elapsed_us = t0.elapsed().as_micros();
+        assert_eq!(free, vec![(64, next - 64)]);
+        eprintln!("bench_shared_heap_range_churn: {CYCLES} cycles in {elapsed_us} us");
+    }
 }
