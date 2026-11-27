@@ -7167,6 +7167,7 @@ unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
+        super::cpu_writes::forget_queue(this as usize);
         super::list_x::on_queue_release(this as usize);
     }
     n
