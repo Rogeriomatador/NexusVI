@@ -22,6 +22,7 @@
 //!
 //! Nothing translates with this yet: `xcl shaders --recomp` reports its counts.
 
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use super::x64_masks;
@@ -35,6 +36,8 @@ const FALSE: B = 0;
 const TRUE: B = 1;
 /// More nodes than this: the program fails with "lane conditions too large".
 const MAX_NODES: usize = 1 << 20;
+/// Bound each optional query cache independently of the BDD node budget.
+const QUERY_MEMO_LIMIT: usize = 4096;
 /// New nodes one reach fact may take before it is weakened.
 const STEP_NODES: usize = 1 << 9;
 /// Passes of the reach fixpoint, restarts after wrong loop-head guesses included.
@@ -56,13 +59,24 @@ struct Bdd {
     nodes: Vec<(u32, B, B)>,
     unique: HashMap<(u32, B, B), B>,
     memo: HashMap<(Op, B, B), B>,
+    /// Cache for `implies(a, b)` results across calls.
+    implies_memo: RefCell<HashMap<(B, B), bool>>,
+    /// Cache for `disjoint(a, b)` results across calls.
+    disjoint_memo: RefCell<HashMap<(B, B), bool>>,
     /// node count `mk` fails at
     limit: usize,
 }
 
 impl Bdd {
     fn new() -> Self {
-        Bdd { nodes: vec![(u32::MAX, 0, 0), (u32::MAX, 1, 1)], unique: HashMap::new(), memo: HashMap::new(), limit: MAX_NODES }
+        Bdd {
+            nodes: vec![(u32::MAX, 0, 0), (u32::MAX, 1, 1)],
+            unique: HashMap::new(),
+            memo: HashMap::new(),
+            implies_memo: RefCell::new(HashMap::new()),
+            disjoint_memo: RefCell::new(HashMap::new()),
+            limit: MAX_NODES,
+        }
     }
 
     /// `f`'s result, or None when it needs more than `STEP_NODES` new nodes (those it made stay:
@@ -138,7 +152,17 @@ impl Bdd {
 
     /// a → b, without building a ∧ ¬b.
     fn implies(&self, a: B, b: B) -> bool {
-        self.implies_in(a, b, &mut HashSet::new())
+        // Check persistent memo first (valid since nodes are only added).
+        if let Some(&res) = self.implies_memo.borrow().get(&(a, b)) {
+            return res;
+        }
+        let mut seen = HashSet::new();
+        let res = self.implies_in(a, b, &mut seen);
+        let mut memo = self.implies_memo.borrow_mut();
+        if memo.len() < QUERY_MEMO_LIMIT {
+            memo.insert((a, b), res);
+        }
+        res
     }
 
     fn implies_in(&self, a: B, b: B, seen: &mut HashSet<(B, B)>) -> bool {
@@ -159,7 +183,22 @@ impl Bdd {
     }
 
     /// a → ¬b, i.e. a ∧ b is false, without building it.
-    fn disjoint(&self, a: B, b: B, seen: &mut HashSet<(B, B)>) -> bool {
+    fn disjoint(&self, a: B, b: B) -> bool {
+        // Check persistent memo first (valid since nodes are only added).
+        let key = (a.min(b), a.max(b));
+        if let Some(&res) = self.disjoint_memo.borrow().get(&key) {
+            return res;
+        }
+        let mut seen = HashSet::new();
+        let res = self.disjoint_in(a, b, &mut seen);
+        let mut memo = self.disjoint_memo.borrow_mut();
+        if memo.len() < QUERY_MEMO_LIMIT {
+            memo.insert(key, res);
+        }
+        res
+    }
+
+    fn disjoint_in(&self, a: B, b: B, seen: &mut HashSet<(B, B)>) -> bool {
         if a == FALSE || b == FALSE {
             return true;
         }
@@ -173,7 +212,7 @@ impl Bdd {
         let v = na.0.min(nb.0);
         let (a0, a1) = if na.0 == v { (na.1, na.2) } else { (a, a) };
         let (b0, b1) = if nb.0 == v { (nb.1, nb.2) } else { (b, b) };
-        self.disjoint(a0, b0, seen) && self.disjoint(a1, b1, seen)
+        self.disjoint_in(a0, b0, seen) && self.disjoint_in(a1, b1, seen)
     }
 
     /// `a` with the atoms `drop` names quantified away (∃).
@@ -779,7 +818,7 @@ impl<'a> Lanes<'a> {
                     self.atom(Atom::Join(b, slot), b)?
                 } else if edges.iter().all(|(fact, s)| self.bdd.implies(*fact, get(s).unwrap())) {
                     TRUE
-                } else if edges.iter().all(|(fact, s)| self.bdd.disjoint(*fact, get(s).unwrap(), &mut HashSet::new())) {
+                } else if edges.iter().all(|(fact, s)| self.bdd.disjoint(*fact, get(s).unwrap())) {
                     FALSE
                 } else {
                     self.atom(Atom::Join(b, slot), b)?
@@ -1009,9 +1048,69 @@ mod tests {
                 let nb = bdd.not(b).unwrap();
                 let (built_imp, built_dis) = (bdd.and(a, nb).unwrap() == FALSE, bdd.and(a, b).unwrap() == FALSE);
                 assert_eq!(bdd.implies(a, b), built_imp, "{a} → {b}");
-                assert_eq!(bdd.disjoint(a, b, &mut HashSet::new()), built_dis, "{a} ∧ {b}");
+                assert_eq!(bdd.disjoint(a, b), built_dis, "{a} ∧ {b}");
             }
         }
+    }
+
+    #[test]
+    fn implies_and_disjoint_are_memoized() {
+        let mut bdd = Bdd::new();
+        let x: Vec<B> = (0..4).map(|v| bdd.mk(v, FALSE, TRUE).unwrap()).collect();
+        let mut fs = vec![FALSE, TRUE];
+        for &a in &x {
+            for &b in &x {
+                let (and, or, xor) = (bdd.and(a, b).unwrap(), bdd.or(a, b).unwrap(), bdd.apply(Op::Xor, a, b).unwrap());
+                let na = bdd.not(a).unwrap();
+                fs.extend([a, and, or, xor, na]);
+            }
+        }
+        // Call implies and disjoint multiple times on the same pairs.
+        for _ in 0..3 {
+            for &a in &fs {
+                for &b in &fs {
+                    let _ = bdd.implies(a, b);
+                    let _ = bdd.disjoint(a, b);
+                }
+            }
+        }
+        // Repeated formulas share canonical node IDs; count distinct pairs.
+        fs.sort_unstable();
+        fs.dedup();
+        let n = fs.len();
+        assert_eq!(bdd.implies_memo.borrow().len(), n * n);
+        assert_eq!(bdd.disjoint_memo.borrow().len(), n * (n + 1) / 2);
+        // Results should still be correct.
+        for &a in &fs {
+            for &b in &fs {
+                let nb = bdd.not(b).unwrap();
+                let (built_imp, built_dis) = (bdd.and(a, nb).unwrap() == FALSE, bdd.and(a, b).unwrap() == FALSE);
+                assert_eq!(bdd.implies(a, b), built_imp, "{a} → {b}");
+                assert_eq!(bdd.disjoint(a, b), built_dis, "{a} ∧ {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn query_memos_stop_growing_without_changing_answers() {
+        let mut bdd = Bdd::new();
+        let atoms: Vec<B> = (0..100).map(|v| bdd.atom(v)).collect();
+        for &a in &atoms {
+            for &b in &atoms {
+                assert_eq!(bdd.implies(a, b), a == b);
+                assert!(!bdd.disjoint(a, b));
+            }
+        }
+        assert_eq!(bdd.implies_memo.borrow().len(), QUERY_MEMO_LIMIT);
+        assert_eq!(bdd.disjoint_memo.borrow().len(), QUERY_MEMO_LIMIT);
+        let new = bdd.atom(100);
+        let not_new = bdd.not(new).unwrap();
+        assert!(bdd.implies(new, new));
+        assert!(!bdd.implies(new, not_new));
+        assert!(bdd.disjoint(new, not_new));
+        assert!(!bdd.disjoint(new, new));
+        assert_eq!(bdd.implies_memo.borrow().len(), QUERY_MEMO_LIMIT);
+        assert_eq!(bdd.disjoint_memo.borrow().len(), QUERY_MEMO_LIMIT);
     }
 
     #[test]
