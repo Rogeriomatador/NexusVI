@@ -21,7 +21,24 @@ use windows::Win32::Graphics::Direct3D12::{ID3D12GraphicsCommandList, D3D12_AUTO
 static LABELS: Mutex<Option<HashMap<usize, String>>> = Mutex::new(None);
 /// PC command list → its last `RECORDINGS` recordings, oldest first: the label of each marker
 /// (`None`: the title's own)
-static MARKS: Mutex<Option<HashMap<usize, Vec<Vec<Option<String>>>>>> = Mutex::new(None);
+static MARKS: Mutex<Option<HashMap<usize, Vec<Recording>>>> = Mutex::new(None);
+
+#[derive(Default)]
+struct Recording {
+    marks: Vec<Option<String>>,
+    has_label: bool,
+}
+
+impl Recording {
+    /// Record a marker, returning whether it is the first labelled marker in this recording.
+    fn push(&mut self, mark: Option<String>) -> bool {
+        let labelled = mark.is_some();
+        let first = labelled && !self.has_label;
+        self.has_label |= labelled;
+        self.marks.push(mark);
+        first
+    }
+}
 
 /// Recordings kept per list: a list can be Reset and recorded again while an earlier
 /// submission of it still runs, and that one can be the one that faults.
@@ -64,17 +81,7 @@ pub unsafe fn mark_pipeline(list: *mut c_void, pso: usize, bound: usize) {
     }
     // nothing labelled: a stand-in still building, or a pipeline of PC shaders
     let text = label_of(bound).unwrap_or_else(|| format!("pipeline {pso:#x} (a stand-in, or not translated)"));
-    let first = {
-        let mut g = MARKS.lock().unwrap();
-        let recordings = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();
-        if recordings.is_empty() {
-            recordings.push(Vec::new());
-        }
-        let cur = recordings.last_mut().unwrap();
-        let first = !cur.iter().any(Option::is_some);
-        cur.push(Some(text));
-        first
-    };
+    let first = push(list as usize, Some(text));
     if let Some(l) = ID3D12GraphicsCommandList::from_raw_borrowed(&list) {
         // DRED's node may give the list's name and not its pointer (NVIDIA, Windows 26300)
         if first {
@@ -93,13 +100,13 @@ pub fn title_marker(list: *mut c_void) {
     }
 }
 
-fn push(list: usize, mark: Option<String>) {
+fn push(list: usize, mark: Option<String>) -> bool {
     let mut g = MARKS.lock().unwrap();
     let recordings = g.get_or_insert_with(HashMap::new).entry(list).or_default();
     if recordings.is_empty() {
-        recordings.push(Vec::new());
+        recordings.push(Recording::default());
     }
-    recordings.last_mut().unwrap().push(mark);
+    recordings.last_mut().unwrap().push(mark)
 }
 
 /// A list was Reset: a new recording, as DRED's history of it starts again too.
@@ -107,7 +114,7 @@ pub fn reset(list: *mut c_void) {
     if on() {
         let mut g = MARKS.lock().unwrap();
         let recordings = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();
-        recordings.push(Vec::new());
+        recordings.push(Recording::default());
         if recordings.len() > RECORDINGS {
             recordings.remove(0);
         }
@@ -134,9 +141,9 @@ pub fn forget_pso(pso: usize) {
 
 /// The recording a DRED history is of: the newest one with as many markers as the history
 /// (else the newest).
-fn recording_of<'a>(recordings: &'a [Vec<Option<String>>], history: &[i32]) -> Option<&'a Vec<Option<String>>> {
+fn recording_of<'a>(recordings: &'a [Recording], history: &[i32]) -> Option<&'a [Option<String>]> {
     let total = markers_before(history, history.len());
-    recordings.iter().rev().find(|r| r.len() == total).or(recordings.last())
+    recordings.iter().rev().find(|r| r.marks.len() == total).or(recordings.last()).map(|r| r.marks.as_slice())
 }
 
 /// How many markers come before operation `done` of a list's history.
@@ -173,10 +180,33 @@ pub fn bound_at(list: usize, history: &[i32], done: usize) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn recording(marks: Vec<Option<String>>) -> Recording {
+        let mut r = Recording::default();
+        for mark in marks {
+            r.push(mark);
+        }
+        r
+    }
+
+    #[test]
+    fn first_label_is_tracked_without_scanning_marker_history() {
+        let mut r = Recording::default();
+        for _ in 0..10_000 {
+            assert!(!r.push(None));
+        }
+        assert!(r.push(Some("first".into())));
+        for _ in 0..10_000 {
+            assert!(!r.push(Some("later".into())));
+        }
+        assert!(!r.push(None));
+        assert_eq!(r.marks.len(), 20_002);
+        assert!(Recording::default().push(Some("new recording".into())));
+    }
+
     #[test]
     fn a_fault_in_an_earlier_recording_finds_that_recording() {
         // the list was Reset and recorded again while its first submission (2 markers) ran
-        let recordings = vec![vec![Some("cs old".to_string()), Some("ms old".to_string())], vec![Some("cs new".to_string())]];
+        let recordings = vec![recording(vec![Some("cs old".to_string()), Some("ms old".to_string())]), recording(vec![Some("cs new".to_string())])];
         let old_history = [46, 0, 6, 0, 6];
         assert_eq!(recording_of(&recordings, &old_history).unwrap()[1].as_deref(), Some("ms old"));
         let new_history = [46, 0, 6];
@@ -210,7 +240,7 @@ mod tests {
         {
             let mut g = MARKS.lock().unwrap();
             let m = g.get_or_insert_with(HashMap::new);
-            m.insert(list, vec![vec![Some("cs a".into()), None, Some("ms b ps c".into())]]);
+            m.insert(list, vec![recording(vec![Some("cs a".into()), None, Some("ms b ps c".into())])]);
         }
         // ops: begin, our marker (cs a), dispatch, the title's marker, dispatch, our marker (ms b), dispatch
         let h = [46, 0, 6, 0, 6, 0, 6];
