@@ -824,10 +824,17 @@ impl ShaderCache {
                 return;
             }
         }
-        let bytes = blob.len()
-            + key.cache_dir.capacity()
-            + shader.dxil.capacity()
-            + shader.samplers.capacity() * std::mem::size_of::<StaticSampler>();
+        // `ShaderEntry::bytes`, the same figure `evict_one` subtracts: an entry measured smaller
+        // here than it is taken out there (a dispatch chain's pieces were missing) drove `bytes`
+        // down to an underflow – a panic in a debug build, a cache that evicts itself in a
+        // release one.
+        let mut entry = ShaderEntry {
+            key,
+            blob: blob.to_vec(),
+            shader,
+            gen: 0,
+        };
+        let bytes = entry.bytes();
         if bytes > self.limit {
             return;
         }
@@ -839,16 +846,9 @@ impl ShaderCache {
         self.next_id += 1;
         self.next_gen += 1;
         let (id, gen) = (self.next_id, self.next_gen);
-        self.by_key.entry(key.clone()).or_default().push(id);
-        self.entries.insert(
-            id,
-            ShaderEntry {
-                key,
-                blob: blob.to_vec(),
-                shader,
-                gen,
-            },
-        );
+        entry.gen = gen;
+        self.by_key.entry(entry.key.clone()).or_default().push(id);
+        self.entries.insert(id, entry);
         self.lru.push_back((id, gen));
         self.bytes += bytes;
     }
@@ -1881,6 +1881,31 @@ mod shader_cache_tests {
         }
         assert_eq!(cache.entries.len(), SHADER_CACHE_MAX_ENTRIES);
         assert!(cache.get(&key(0), b"a").is_none());
+    }
+
+    #[test]
+    fn shader_cache_counts_an_entry_the_same_way_inserting_and_evicting() {
+        // A split compute program keeps its pieces in `dispatch_chain`. `insert` used to leave
+        // them out of the figure `evict_one` subtracts, so `bytes` drifted down and finally
+        // underflowed: a panic in a debug build, a cache that evicts itself in a release one.
+        // The invariant is that `bytes` is what the map holds.
+        let chained = Arc::new(Compiled {
+            dispatch_chain: Some(Arc::new(crate::gpu::dxil::kernel::DispatchChain {
+                pieces: vec![vec![0u8; 4096]; 2],
+                dwords_per_group: 1,
+            })),
+            dxil: synthetic_dxil(3),
+            samplers: Vec::new(),
+        });
+        let per_entry = ShaderEntry { key: key(1), blob: b"a".to_vec(), shader: chained.clone(), gen: 0 }.bytes();
+        assert!(per_entry > 8192, "the chain's pieces are counted: {per_entry}");
+        let mut cache = ShaderCache::new(per_entry * 3);
+        for i in 0..6u64 {
+            cache.insert(key(i), b"a", chained.clone());
+            let held: usize = cache.entries.values().map(ShaderEntry::bytes).sum();
+            assert_eq!(cache.bytes, held, "after insert {i}");
+        }
+        assert!((2..=3).contains(&cache.entries.len()), "{}", cache.entries.len());
     }
 
     #[test]
