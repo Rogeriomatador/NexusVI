@@ -62,7 +62,7 @@ jobs:
           pwsh -NoProfile -File ./scripts/test.ps1 --skip test_title_runs_and_game_folder_is_untouched --nocapture 2>&1 |
             Tee-Object -FilePath target/nexusvi-evidence/cargo.log
           $cargoExit = $LASTEXITCODE
-          python scripts/nexusvi_test_summary.py target/nexusvi-evidence/cargo.log --exit-code $cargoExit |
+          python scripts/nexusvi_test_summary.py target/nexusvi-evidence/cargo.log --exit-code $cargoExit --revision $env:GITHUB_SHA |
             Set-Content -Encoding utf8 target/nexusvi-evidence/summary.json
           $summaryExit = $LASTEXITCODE
           if ($cargoExit -ne 0) { exit $cargoExit }

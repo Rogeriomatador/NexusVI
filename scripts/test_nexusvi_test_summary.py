@@ -35,5 +35,39 @@ class TestSummary(unittest.TestCase):
         self.assertEqual(r['status'], 'reported_pass')
 
 
+    def test_truncated_last_suite(self):
+        r = summarize('running 7 tests\n' + OK + '\nrunning 1 test', 0)
+        self.assertEqual(r['status'], 'incomplete')
+        self.assertTrue(r['suite_integrity']['unfinished_suite'])
+
+    def test_mismatched_suite_size(self):
+        r = summarize('running 8 tests\n' + OK, 0)
+        self.assertEqual(r['status'], 'incomplete')
+        self.assertEqual(r['suite_integrity']['mismatches'], 1)
+
+    def test_complete_timestamped_log(self):
+        stamp = '2026-11-27T09:19:21.0055939Z '
+        log = '\n'.join(stamp + x for x in ['running 7 tests', OK])
+        r = summarize(log, 0, 'abc')
+        self.assertEqual(r['status'], 'reported_pass')
+        self.assertEqual(r['revision'], 'abc')
+        self.assertEqual(r['suite_integrity']['starts'], 1)
+
+    def test_skip_events_distinct_from_names_and_missing_samples(self):
+        r = summarize(OK + '\nSKIPPED a: no GPU\nSKIPPED a: no GPU\n'
+                      'SKIPPED b: no GPU\nnot set, their tests are skipped: XCL_SAMPLE_A, XCL_SAMPLE_B', 0)
+        self.assertEqual(r['distinct_observed_skip_names'], 2)
+        self.assertEqual(r['observed_skip_events'], {'no GPU': 3})
+        self.assertEqual(r['missing_sample_variables'], ['XCL_SAMPLE_A', 'XCL_SAMPLE_B'])
+
+    def test_failed_name(self):
+        r = summarize('running 3 tests\ntest module::bad ... FAILED\n' + FAIL, 1)
+        self.assertEqual(r['failed_test_names'], ['module::bad'])
+        self.assertEqual(r['status'], 'failed')
+
+    def test_unmatched_summary_with_starts(self):
+        self.assertEqual(summarize('running 7 tests\n' + OK + '\n' + OK, 0)['status'], 'incomplete')
+
+
 if __name__ == '__main__':
     unittest.main()
