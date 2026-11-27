@@ -12,7 +12,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'nexusvi/**']
   pull_request:
 
 permissions:
@@ -49,6 +49,30 @@ jobs:
           key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: cargo-${{ runner.os }}-
 
-      - name: Build and test
+      - name: Test evidence parser
         shell: pwsh
-        run: ./scripts/test.ps1 --skip test_title_runs_and_game_folder_is_untouched
+        run: python -m unittest discover -s scripts -p test_nexusvi_test_summary.py -v
+
+      - name: Build and test with evidence
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
+          New-Item -ItemType Directory -Path target/nexusvi-evidence -Force | Out-Null
+          pwsh -NoProfile -File ./scripts/test.ps1 --skip test_title_runs_and_game_folder_is_untouched --nocapture 2>&1 |
+            Tee-Object -FilePath target/nexusvi-evidence/cargo.log
+          $cargoExit = $LASTEXITCODE
+          python scripts/nexusvi_test_summary.py target/nexusvi-evidence/cargo.log --exit-code $cargoExit |
+            Set-Content -Encoding utf8 target/nexusvi-evidence/summary.json
+          $summaryExit = $LASTEXITCODE
+          if ($cargoExit -ne 0) { exit $cargoExit }
+          exit $summaryExit
+
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexusvi-test-evidence
+          path: target/nexusvi-evidence/summary.json
+          if-no-files-found: warn
+          retention-days: 14

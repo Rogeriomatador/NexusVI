@@ -86,12 +86,21 @@ pub(super) fn note_queue_wait(fence: usize, value: u64) {
     f.waited = f.waited.max(value);
 }
 
+fn refresh_one(fence: usize) {
+    let cell = {
+        let g = FENCES.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().and_then(|m| m.get(&fence)).and_then(|f| f.cell)
+    };
+    if let Some(c) = cell {
+        if let Some(v) = unsafe { borrowed(fence, |f| f.GetCompletedValue()) } {
+            c.0.store(v, Ordering::Release);
+        }
+    }
+}
+
 /// The CPU signalled `fence`.
 pub(super) fn note_cpu_signal(fence: usize) {
-    let known = FENCES.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|m| m.get(&fence).is_some_and(|f| f.cell.is_some()));
-    if known {
-        refresh();
-    }
+    refresh_one(fence);
 }
 
 /// Diagnostic summary of title fences whose completed value lags their signalled or waited value.
@@ -128,7 +137,7 @@ pub(super) unsafe extern "system" fn completed_value_address(this: *mut c_void) 
     if pending > 0 {
         arm(this as usize, pending);
     }
-    refresh();
+    refresh_one(this as usize);
     cell.0.as_ptr()
 }
 
