@@ -49,6 +49,10 @@ jobs:
           key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: cargo-${{ runner.os }}-
 
+      - name: Test evidence parser
+        shell: pwsh
+        run: python -m unittest discover -s scripts -p test_nexusvi_test_summary.py -v
+
       - name: Build and test
         shell: pwsh
         run: ./scripts/test.ps1 --skip test_title_runs_and_game_folder_is_untouched
