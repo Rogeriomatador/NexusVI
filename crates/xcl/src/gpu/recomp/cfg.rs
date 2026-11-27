@@ -87,27 +87,22 @@ impl Cfg {
     pub fn post_dominators(&self) -> Vec<PostDom> {
         let nb = self.start.len();
         let exit = nb;
-        // the reversed graph's successors of a node: the blocks that can go to it
-        let rsucc = |v: usize| -> Vec<usize> {
-            if v == exit {
-                (0..nb).filter(|&b| self.succ[b].is_empty()).collect()
-            } else {
-                self.pred[v].clone()
-            }
-        };
+        // Only the synthetic exit needs its own adjacency list. Borrow the existing
+        // graph edges for every real block rather than cloning them during traversal.
+        let exits: Vec<usize> = (0..nb).filter(|&b| self.succ[b].is_empty()).collect();
         // post-order of the reversed graph from the exit
         let mut order = vec![usize::MAX; nb + 1];
         let mut post = Vec::with_capacity(nb + 1);
         let mut seen = vec![false; nb + 1];
-        let mut stack = vec![(exit, rsucc(exit), 0usize)];
+        let mut stack = vec![(exit, 0usize)];
         seen[exit] = true;
-        while let Some((v, next, k)) = stack.last_mut() {
+        while let Some((v, k)) = stack.last_mut() {
+            let next = if *v == exit { exits.as_slice() } else { self.pred[*v].as_slice() };
             if let Some(&w) = next.get(*k) {
                 *k += 1;
                 if !seen[w] {
                     seen[w] = true;
-                    let ws = rsucc(w);
-                    stack.push((w, ws, 0));
+                    stack.push((w, 0));
                 }
             } else {
                 order[*v] = post.len();
@@ -115,14 +110,6 @@ impl Cfg {
                 stack.pop();
             }
         }
-        // the reversed graph's predecessors of a block: its successors, and the exit after a last block
-        let rpred = |v: usize| -> Vec<usize> {
-            if self.succ[v].is_empty() {
-                vec![exit]
-            } else {
-                self.succ[v].clone()
-            }
-        };
         let mut idom = vec![usize::MAX; nb + 1];
         idom[exit] = exit;
         let intersect = |idom: &[usize], mut a: usize, mut b: usize| {
@@ -141,7 +128,9 @@ impl Cfg {
             changed = false;
             for &v in post.iter().rev().filter(|&&v| v != exit) {
                 let mut new = usize::MAX;
-                for p in rpred(v) {
+                // A terminal block has one synthetic successor; no temporary Vec is needed.
+                let next = if self.succ[v].is_empty() { std::slice::from_ref(&exit) } else { self.succ[v].as_slice() };
+                for &p in next {
                     let p = if seen[p] { p } else { exit };
                     if idom[p] == usize::MAX {
                         continue;
@@ -324,6 +313,20 @@ mod tests {
         let pd = g.post_dominators();
         assert_eq!(pd, vec![PostDom::Exit, PostDom::None, PostDom::None, PostDom::Exit]);
         assert_eq!(g.control_dependence(&pd), vec![vec![], vec![0], vec![0], vec![0]]);
+    }
+
+    #[test]
+    fn multiple_exits_and_a_back_edge() {
+        let g = Cfg {
+            start: vec![0, 1, 2, 3, 4],
+            block_of: vec![0, 1, 2, 3, 4],
+            succ: vec![vec![1, 2], vec![3], vec![2, 4], vec![], vec![]],
+            pred: vec![vec![], vec![0], vec![0, 2], vec![1], vec![2]],
+            len: 5,
+        };
+        assert_eq!(g.post_dominators(), vec![PostDom::Exit, PostDom::Block(3), PostDom::Block(4), PostDom::Exit, PostDom::Exit]);
+        let empty = Cfg { start: vec![], block_of: vec![], succ: vec![], pred: vec![], len: 0 };
+        assert!(empty.post_dominators().is_empty());
     }
 
     #[test]
