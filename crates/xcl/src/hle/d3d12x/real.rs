@@ -130,6 +130,22 @@ pub struct D3d12Stats {
     /// DXIL cache and compiler statistics.
     #[serde(default)]
     pub dxil_cache: crate::gpu::recomp::dxc::CacheStats,
+    /// Bottom-of-pipe CPU writes queued, completed, and timed out.
+    #[serde(default)]
+    pub cpu_writes_queued: u64,
+    #[serde(default)]
+    pub cpu_writes_completed: u64,
+    #[serde(default)]
+    pub cpu_writes_late: u64,
+    /// Frame clock activity: WaitFrameEventX calls/timeouts and GetFrameStatisticsX calls/misses.
+    #[serde(default)]
+    pub frame_wait_calls: u64,
+    #[serde(default)]
+    pub frame_wait_timeouts: u64,
+    #[serde(default)]
+    pub frame_stats_calls: u64,
+    #[serde(default)]
+    pub frame_stats_misses: u64,
 }
 
 static ADAPTER: Mutex<String> = Mutex::new(String::new());
@@ -396,6 +412,8 @@ pub fn stats() -> D3d12Stats {
         })
         .unwrap_or_default();
     let (presents, boundaries) = super::present::counters();
+    let (cw_queued, cw_completed, cw_late) = super::cpu_writes::stats();
+    let [fw_calls, fw_timeouts, fs_calls, fs_misses] = super::frame::activity();
     D3d12Stats {
         backend: format!("{:?}", super::backend()).to_lowercase(),
         adapter: ADAPTER.lock().map(|a| a.clone()).unwrap_or_default(),
@@ -419,6 +437,13 @@ pub fn stats() -> D3d12Stats {
         translation_errors: TRANSLATE_ERRORS.lock().map(|e| e.clone()).unwrap_or_default(),
         background_pipelines: super::pso_async::counts(),
         dxil_cache: crate::gpu::recomp::dxc::cache_stats(),
+        cpu_writes_queued: cw_queued,
+        cpu_writes_completed: cw_completed,
+        cpu_writes_late: cw_late,
+        frame_wait_calls: fw_calls,
+        frame_wait_timeouts: fw_timeouts,
+        frame_stats_calls: fs_calls,
+        frame_stats_misses: fs_misses,
     }
 }
 
