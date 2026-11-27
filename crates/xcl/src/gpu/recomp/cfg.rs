@@ -354,6 +354,169 @@ mod tests {
         assert!(cd[..n].iter().all(Vec::is_empty));
     }
 
+    // Freeze the pre-optimization implementations from XCL commit 83b00818 as
+    // a differential test oracle, not a production execution path.
+    impl Cfg {
+        fn reference_post_dominators(&self) -> Vec<PostDom> {
+            let nb = self.start.len();
+            let exit = nb;
+            // the reversed graph's successors of a node: the blocks that can go to it
+            let rsucc = |v: usize| -> Vec<usize> {
+                if v == exit {
+                    (0..nb).filter(|&b| self.succ[b].is_empty()).collect()
+                } else {
+                    self.pred[v].clone()
+                }
+            };
+            // post-order of the reversed graph from the exit
+            let mut order = vec![usize::MAX; nb + 1];
+            let mut post = Vec::with_capacity(nb + 1);
+            let mut seen = vec![false; nb + 1];
+            let mut stack = vec![(exit, rsucc(exit), 0usize)];
+            seen[exit] = true;
+            while let Some((v, next, k)) = stack.last_mut() {
+                if let Some(&w) = next.get(*k) {
+                    *k += 1;
+                    if !seen[w] {
+                        seen[w] = true;
+                        let ws = rsucc(w);
+                        stack.push((w, ws, 0));
+                    }
+                } else {
+                    order[*v] = post.len();
+                    post.push(*v);
+                    stack.pop();
+                }
+            }
+            // the reversed graph's predecessors of a block: its successors, and the exit after a last block
+            let rpred = |v: usize| -> Vec<usize> {
+                if self.succ[v].is_empty() {
+                    vec![exit]
+                } else {
+                    self.succ[v].clone()
+                }
+            };
+            let mut idom = vec![usize::MAX; nb + 1];
+            idom[exit] = exit;
+            let intersect = |idom: &[usize], mut a: usize, mut b: usize| {
+                while a != b {
+                    while order[a] < order[b] {
+                        a = idom[a];
+                    }
+                    while order[b] < order[a] {
+                        b = idom[b];
+                    }
+                }
+                a
+            };
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for &v in post.iter().rev().filter(|&&v| v != exit) {
+                    let mut new = usize::MAX;
+                    for p in rpred(v) {
+                        let p = if seen[p] { p } else { exit };
+                        if idom[p] == usize::MAX {
+                            continue;
+                        }
+                        new = if new == usize::MAX { p } else { intersect(&idom, p, new) };
+                    }
+                    if new != usize::MAX && idom[v] != new {
+                        idom[v] = new;
+                        changed = true;
+                    }
+                }
+            }
+            (0..nb)
+                .map(|b| match idom[b] {
+                    usize::MAX => PostDom::None,
+                    d if d == exit => PostDom::Exit,
+                    d => PostDom::Block(d),
+                })
+                .collect()
+        }
+
+        /// For each block, the blocks with a branch it is control-dependent on: the branch decides
+        /// whether the block runs (Ferrante, Ottenstein and Warren: from each successor of a branch up
+        /// the post-dominator tree to the branch's own post-dominator). A block on a path that never
+        /// ends the program counts as dependent on every branch that leads to it.
+        fn reference_control_dependence(&self, ipdom: &[PostDom]) -> Vec<Vec<usize>> {
+            let mut cd: Vec<Vec<usize>> = vec![Vec::new(); self.start.len()];
+            for (a, s) in self.succ.iter().enumerate() {
+                if s.len() < 2 {
+                    continue;
+                }
+                let stop = ipdom[a];
+                for &first in s {
+                    let mut run = first;
+                    loop {
+                        if PostDom::Block(run) == stop {
+                            break;
+                        }
+                        if !cd[run].contains(&a) {
+                            cd[run].push(a);
+                        } else {
+                            break;
+                        }
+                        match ipdom[run] {
+                            PostDom::Block(next) => run = next,
+                            PostDom::Exit => break,
+                            PostDom::None => {
+                                // nothing after it ends the program either: every block from here on
+                                // runs only on this side
+                                let mut todo = self.succ[run].clone();
+                                while let Some(b) = todo.pop() {
+                                    if !cd[b].contains(&a) {
+                                        cd[b].push(a);
+                                        todo.extend(self.succ[b].iter().copied());
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            cd
+        }
+    }
+
+    #[test]
+    fn exhaustive_small_graphs_match_pre_optimization_analysis() {
+        let mut checked = 0usize;
+        for n in 0usize..=4 {
+            for mask in 0usize..(1usize << (n * n)) {
+                let mut succ = vec![Vec::new(); n];
+                let mut pred = vec![Vec::new(); n];
+                for a in 0..n {
+                    for b in 0..n {
+                        if mask & (1usize << (a * n + b)) != 0 {
+                            succ[a].push(b);
+                            pred[b].push(a);
+                        }
+                    }
+                }
+                let g = Cfg {
+                    start: (0..n).collect(),
+                    block_of: (0..n).collect(),
+                    succ,
+                    pred,
+                    len: n,
+                };
+                let expected = g.reference_post_dominators();
+                let actual = g.post_dominators();
+                assert_eq!(actual, expected, "post-dominators: n={n}, mask={mask}");
+                assert_eq!(
+                    g.control_dependence(&actual),
+                    g.reference_control_dependence(&expected),
+                    "control dependence: n={n}, mask={mask}"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 66_067);
+    }
+
     #[test]
     fn an_indirect_jump_gives_no_graph() {
         let p = program(&[("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 4)], None)]);
